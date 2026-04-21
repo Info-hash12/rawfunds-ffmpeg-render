@@ -17,25 +17,28 @@ PORT = int(os.environ.get("PORT", 5000))
 # ---------------------------------------------------------------------------
 FRAME_W = 1080
 FRAME_H = 1920
-SAFE_MARGIN = 60  # px padding on each side
-MAX_TEXT_W = FRAME_W - 2 * SAFE_MARGIN  # 960 px usable width
+SAFE_MARGIN = 100  # px padding on each side (was 60)
+MAX_TEXT_W = FRAME_W - 2 * SAFE_MARGIN  # 880 px usable width (was 960)
 
 # ---------------------------------------------------------------------------
-# Font configuration â DejaVu Sans is installed via apt
+# Font configuration - DejaVu Sans is installed via apt
 # ---------------------------------------------------------------------------
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_PATH_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-# Font-size ranges (max â min) for each text role
+# Font-size ranges (max -> min) for each text role
 FONT_RANGES = {
-    "headline":    {"max": 72, "min": 44, "step": 2},
-    "subheadline": {"max": 52, "min": 32, "step": 2},
-    "cta":         {"max": 48, "min": 30, "step": 2},
+    "headline":    {"max": 72, "min": 32, "step": 2},   # min was 44
+    "subheadline": {"max": 52, "min": 28, "step": 2},   # min was 32
+    "cta":         {"max": 48, "min": 26, "step": 2},   # min was 30
 }
+
+# Stroke width used in drawtext (borderw) - must be accounted for in measurement
+STROKE_W = 3
 
 
 def _find_font_path():
-    """Return a working .ttf path â try DejaVu first, then fall back."""
+    """Return a working .ttf path - try DejaVu first, then fall back."""
     candidates = [
         FONT_PATH,
         FONT_PATH_REGULAR,
@@ -49,28 +52,33 @@ def _find_font_path():
 
 
 # ---------------------------------------------------------------------------
-# Text measurement with Pillow
+# Text measurement with Pillow  (accounts for stroke width + safety buffer)
 # ---------------------------------------------------------------------------
 try:
     from PIL import ImageFont
 
     def measure_text_width(text, font_size, bold=True):
-        """Return pixel width of *text* rendered at *font_size*."""
+        """Return pixel width of *text* rendered at *font_size*.
+
+        Adds stroke-width compensation (borderw * 2) and a 20 % safety buffer
+        so the FFmpeg drawtext output never clips at the frame edge.
+        """
         fpath = FONT_PATH if bold else FONT_PATH_REGULAR
         if not os.path.exists(fpath):
             fpath = _find_font_path()
         try:
             font = ImageFont.truetype(fpath, font_size)
             bbox = font.getbbox(text)
-            return bbox[2] - bbox[0]
+            raw_w = bbox[2] - bbox[0]
         except Exception:
-            # Rough estimate: average char width â 0.6 Ã font_size
-            return int(len(text) * font_size * 0.6)
+            raw_w = int(len(text) * font_size * 0.6)
+        # Add stroke compensation + 20 % safety buffer
+        return int((raw_w + STROKE_W * 2) * 1.20)
 
 except ImportError:
-    # Pillow not available â use character-count estimate
     def measure_text_width(text, font_size, bold=True):
-        return int(len(text) * font_size * 0.6)
+        raw_w = int(len(text) * font_size * 0.6)
+        return int((raw_w + STROKE_W * 2) * 1.20)
 
 
 def auto_fit_fontsize(text, role="headline"):
@@ -82,22 +90,70 @@ def auto_fit_fontsize(text, role="headline"):
     cfg = FONT_RANGES.get(role, FONT_RANGES["headline"])
     fmax, fmin, fstep = cfg["max"], cfg["min"], cfg["step"]
 
-    # 1. Try reducing font size first
     for fs in range(fmax, fmin - 1, -fstep):
         w = measure_text_width(text, fs)
         if w <= MAX_TEXT_W:
             return fs, 0
 
-    # 2. At min font size, try compressing letter spacing
+    # At min font size, try compressing letter spacing
     fs = fmin
-    for spacing in range(0, -6, -1):  # 0, -1, -2, â¦ -5
+    for spacing in range(0, -6, -1):
         estimated_w = measure_text_width(text, fs) + spacing * max(len(text) - 1, 1)
         if estimated_w <= MAX_TEXT_W:
             return fs, spacing
 
-    # 3. Last resort â clamp at min size, zero spacing; FFmpeg x-clamp will
-    #    keep it inside the frame (text may be slightly truncated visually).
     return fmin, 0
+
+
+# ---------------------------------------------------------------------------
+# Word-wrapping: split long text into multiple lines when it won't fit
+# ---------------------------------------------------------------------------
+def wrap_text_to_width(text, role="headline"):
+    """Auto-fit *text* and, if it still overflows, word-wrap into multiple lines.
+
+    Returns a list of ``(line_text, font_size, letter_spacing)`` tuples.
+    """
+    if not text or not text.strip():
+        return [("", FONT_RANGES.get(role, FONT_RANGES["headline"])["max"], 0)]
+
+    # First try single-line fit
+    fs, sp = auto_fit_fontsize(text, role)
+    w = measure_text_width(text, fs) + sp * max(len(text) - 1, 1)
+    if w <= MAX_TEXT_W:
+        return [(text, fs, sp)]
+
+    # Need to wrap - find font size where wrapped lines fit
+    cfg = FONT_RANGES.get(role, FONT_RANGES["headline"])
+    fmax, fmin, fstep = cfg["max"], cfg["min"], cfg["step"]
+
+    words = text.split()
+
+    for fs in range(fmax, fmin - 1, -fstep):
+        lines = _break_into_lines(words, fs)
+        if all(measure_text_width(ln, fs) <= MAX_TEXT_W for ln in lines):
+            return [(ln, fs, 0) for ln in lines]
+
+    # At minimum size, force-wrap whatever we get
+    fs = fmin
+    lines = _break_into_lines(words, fs)
+    return [(ln, fs, 0) for ln in lines]
+
+
+def _break_into_lines(words, font_size):
+    """Greedily pack *words* into lines that fit within MAX_TEXT_W."""
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if measure_text_width(candidate, font_size) <= MAX_TEXT_W:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines if lines else [""]
 
 
 # ---------------------------------------------------------------------------
@@ -126,17 +182,13 @@ def esc(t):
 
 
 def clamp_x_expr(margin=SAFE_MARGIN):
-    """Return an FFmpeg expression that centres text but clamps to safe margins.
-
-    Logic: x = max(margin, min((w-text_w)/2, w - text_w - margin))
-    This guarantees text_w pixels always land between margin..w-margin.
-    """
+    """Return an FFmpeg expression that centres text but clamps to safe margins."""
     m = margin
     return f"max({m}\\,min((w-text_w)/2\\,w-text_w-{m}))"
 
 
 def drawtext_filter(text, fontsize, yexpr, fontcolor="white",
-                    borderw=2, bordercolor="black", bold=True,
+                    borderw=3, bordercolor="black", bold=True,
                     letter_spacing=0):
     """Build a single drawtext= clause."""
     fpath = _find_font_path()
@@ -150,16 +202,36 @@ def drawtext_filter(text, fontsize, yexpr, fontcolor="white",
         f"y={yexpr}",
         f"fontfile={fpath}",
     ]
-    # FFmpeg â¥ 5.x doesn't have a native letter_spacing param in all builds,
-    # so we only add it when non-zero and hope the build supports it.
-    # If unsupported, FFmpeg silently ignores it.
     if letter_spacing != 0:
         try:
-            # Test if build supports it by just adding it â worst case it's ignored
             parts.append(f"letter_spacing={letter_spacing}")
         except Exception:
             pass
     return ":".join(parts)
+
+
+def build_multiline_drawtext(wrapped_lines, base_y_expr, fontcolor="white",
+                             borderw=3, bordercolor="black"):
+    """Build a chain of drawtext filters for wrapped (possibly multi-line) text.
+
+    *wrapped_lines* is a list of (text, fontsize, letter_spacing) tuples.
+    Returns a list of drawtext filter strings.
+    """
+    filters = []
+    for idx, (text, fontsize, sp) in enumerate(wrapped_lines):
+        if not text.strip():
+            continue
+        line_height = int(fontsize * 1.3)
+        if idx == 0:
+            yexpr = base_y_expr
+        else:
+            yexpr = f"{base_y_expr}+{line_height * idx}"
+        filters.append(drawtext_filter(
+            text, fontsize, yexpr,
+            fontcolor=fontcolor, borderw=borderw,
+            bordercolor=bordercolor, letter_spacing=sp
+        ))
+    return filters
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +239,7 @@ def drawtext_filter(text, fontsize, yexpr, fontcolor="white",
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "ffmpeg-render", "version": "2.0-textfit"}), 200
+    return jsonify({"ok": True, "service": "ffmpeg-render", "version": "3.0-textwrap"}), 200
 
 
 @app.route("/files/<path:filename>", methods=["GET"])
@@ -203,22 +275,29 @@ def render_reel():
                 f.write(resp.content)
             img_paths.append(img_path)
 
-        # --- Auto-fit font sizes --------------------------------------------
-        h1_size, h1_sp = auto_fit_fontsize(headline_line1, "headline")
-        h2_size, h2_sp = auto_fit_fontsize(headline_line2, "headline")
-        sub_size, sub_sp = auto_fit_fontsize(subheadline, "subheadline")
-        cta1_size, cta1_sp = auto_fit_fontsize(cta_line1, "cta")
-        cta2_size, cta2_sp = auto_fit_fontsize(cta_line2, "cta")
+        # --- Auto-fit + wrap text -------------------------------------------
+        h1_lines = wrap_text_to_width(headline_line1, "headline")
+        h2_lines = wrap_text_to_width(headline_line2, "headline")
+        sub_lines = wrap_text_to_width(subheadline, "subheadline")
+        cta1_lines = wrap_text_to_width(cta_line1, "cta")
+        cta2_lines = wrap_text_to_width(cta_line2, "cta")
+
+        # Extract representative font sizes for response
+        h1_size = h1_lines[0][1] if h1_lines else 72
+        h2_size = h2_lines[0][1] if h2_lines else 72
+        sub_size = sub_lines[0][1] if sub_lines else 52
+        cta1_size = cta1_lines[0][1] if cta1_lines else 48
+        cta2_size = cta2_lines[0][1] if cta2_lines else 48
 
         # --- Y positions (proportional to 1920-high frame) ------------------
-        # Headline block ~30 % from top
-        h1_y = f"h*0.30"
-        h2_y = f"h*0.30+{h1_size + 12}"  # line gap = 12px
-        # Subheadline ~50 %
-        sub_y = f"h*0.50"
-        # CTA block ~70 %
-        cta1_y = f"h*0.70"
-        cta2_y = f"h*0.70+{cta1_size + 10}"
+        h1_y = "h*0.28"
+        # h2 starts after h1 block
+        h1_block_height = int(h1_size * 1.3) * len(h1_lines) + 12
+        h2_y = f"h*0.28+{h1_block_height}"
+        sub_y = "h*0.50"
+        cta1_y = "h*0.68"
+        cta1_block_height = int(cta1_size * 1.3) * len(cta1_lines) + 10
+        cta2_y = f"h*0.68+{cta1_block_height}"
 
         # --- Build filter_complex -------------------------------------------
         inputs_args = []
@@ -229,7 +308,6 @@ def render_reel():
         concat_inputs = ""
 
         for i in range(4):
-            # Scale + crop to exact frame
             base = (
                 f"[{i}]scale={FRAME_W}:{FRAME_H}:"
                 f"force_original_aspect_ratio=increase,"
@@ -238,24 +316,23 @@ def render_reel():
             )
             filter_parts.append(base)
 
-            # Overlay text with safe-margin clamping
-            txt = f"[bg{i}]"
-            txt += drawtext_filter(headline_line1, h1_size, h1_y,
-                                   fontcolor="white", borderw=3,
-                                   letter_spacing=h1_sp) + ","
-            txt += drawtext_filter(headline_line2, h2_size, h2_y,
-                                   fontcolor="white", borderw=3,
-                                   letter_spacing=h2_sp) + ","
-            txt += drawtext_filter(subheadline, sub_size, sub_y,
-                                   fontcolor="yellow", borderw=2,
-                                   letter_spacing=sub_sp) + ","
-            txt += drawtext_filter(cta_line1, cta1_size, cta1_y,
-                                   fontcolor="white", borderw=2,
-                                   letter_spacing=cta1_sp) + ","
-            txt += drawtext_filter(cta_line2, cta2_size, cta2_y,
-                                   fontcolor="white", borderw=2,
-                                   letter_spacing=cta2_sp)
-            txt += f"[v{i}];"
+            # Build all drawtext filters for this frame
+            dt_filters = []
+            dt_filters.extend(build_multiline_drawtext(
+                h1_lines, h1_y, fontcolor="white", borderw=3))
+            dt_filters.extend(build_multiline_drawtext(
+                h2_lines, h2_y, fontcolor="white", borderw=3))
+            dt_filters.extend(build_multiline_drawtext(
+                sub_lines, sub_y, fontcolor="yellow", borderw=2))
+            dt_filters.extend(build_multiline_drawtext(
+                cta1_lines, cta1_y, fontcolor="white", borderw=2))
+            dt_filters.extend(build_multiline_drawtext(
+                cta2_lines, cta2_y, fontcolor="white", borderw=2))
+
+            if dt_filters:
+                txt = f"[bg{i}]" + ",".join(dt_filters) + f"[v{i}];"
+            else:
+                txt = f"[bg{i}]null[v{i}];"
             filter_parts.append(txt)
             concat_inputs += f"[v{i}]"
 
@@ -307,12 +384,12 @@ def render_reel():
                 "cta_line1": cta1_size,
                 "cta_line2": cta2_size,
             },
-            "letter_spacing": {
-                "headline_line1": h1_sp,
-                "headline_line2": h2_sp,
-                "subheadline": sub_sp,
-                "cta_line1": cta1_sp,
-                "cta_line2": cta2_sp,
+            "line_counts": {
+                "headline_line1": len(h1_lines),
+                "headline_line2": len(h2_lines),
+                "subheadline": len(sub_lines),
+                "cta_line1": len(cta1_lines),
+                "cta_line2": len(cta2_lines),
             },
         }), 200
 
